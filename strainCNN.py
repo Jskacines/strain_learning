@@ -59,14 +59,14 @@ class StrainForceCNN(nn.Module):
         
         # Convolutional feature extraction layers
         self.conv_block1 = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=7, padding=3),
+            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=7, padding=3, dilation=2),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2)
         )
         
         self.conv_block2 = nn.Sequential(
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=7, padding=3, dilation=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2)
@@ -108,7 +108,6 @@ class StrainForceCNN(nn.Module):
         x = x.view(x.size(0), -1)  # Flatten
         x = self.fc_layers(x)
         return x
-
 
 # Training function
 def train_epoch(model, dataloader, criterion, optimizer, device):
@@ -195,6 +194,7 @@ def train_model(xdata, ydata, train_idxs, val_idxs, epochs=100, batch_size=32, l
     
     # Loss and optimizer
     criterion = nn.MSELoss()
+    # criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
                                                        factor=0.5, patience=5)
