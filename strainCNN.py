@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
@@ -153,7 +153,7 @@ def validate(model, dataloader, criterion, device):
 
 
 # Main training pipeline
-def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001, 
+def train_model(xdata, ydata, train_idxs, val_idxs, epochs=100, batch_size=32, learning_rate=0.001, 
                 val_split=0.2, patience=15):
     """
     Complete training pipeline
@@ -178,7 +178,9 @@ def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001,
     # Train/validation split
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset = Subset(dataset, train_idxs)
+    val_dataset = Subset(dataset, val_idxs)
     
     # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
