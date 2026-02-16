@@ -48,7 +48,7 @@ class StrainForceDataset(Dataset):
 # CNN Model
 class StrainForceCNN(nn.Module):
     """1D CNN for strain signal to force prediction"""
-    def __init__(self, input_length, num_outputs, dropout_rate=0.3):
+    def __init__(self, input_length, num_outputs, dropout_rate=0.6):
         """
         Args:
             input_length: Length of input strain signal
@@ -59,24 +59,27 @@ class StrainForceCNN(nn.Module):
         
         # Convolutional feature extraction layers
         self.conv_block1 = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=32, kernel_size=7, padding=3, dilation=2),
-            nn.BatchNorm1d(32),
+            nn.Conv1d(in_channels=1, out_channels=16, kernel_size=7, padding=3, dilation=2),
+            nn.BatchNorm1d(16),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(0.2),
         )
         
         self.conv_block2 = nn.Sequential(
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=7, padding=3, dilation=2),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=7, padding=3, dilation=2),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(0.2),
         )
         
         self.conv_block3 = nn.Sequential(
-            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2)
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(0.2),        
         )
         
         # Calculate flattened size after convolutions
@@ -85,12 +88,12 @@ class StrainForceCNN(nn.Module):
         # Fully connected layers
         self.fc_layers = nn.Sequential(
             nn.Dropout(dropout_rate),
-            nn.Linear(self.flattened_size, 256),
+            nn.Linear(self.flattened_size, 128),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(256, 128),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(128, num_outputs)
+            nn.Linear(64, num_outputs)
         )
     
     def _get_flattened_size(self, input_length):
@@ -150,9 +153,32 @@ def validate(model, dataloader, criterion, device):
     
     return total_loss / len(dataloader)
 
-
+class WeightedMSELoss(nn.Module):
+    def __init__(self, zero_weight=1.0, nonzero_weight=5.0, threshold=0.1):
+        """
+        Args:
+            zero_weight: Weight for samples near zero
+            nonzero_weight: Weight for non-zero samples
+            threshold: Values below this are considered "zero"
+        """
+        super().__init__()
+        self.zero_weight = zero_weight
+        self.nonzero_weight = nonzero_weight
+        self.threshold = threshold
+    
+    def forward(self, predictions, targets):
+        # Create weight mask based on target values
+        is_nonzero = (torch.abs(targets) > self.threshold).float()
+        weights = is_nonzero * self.nonzero_weight + (1 - is_nonzero) * self.zero_weight
+        
+        # Weighted MSE
+        squared_error = (predictions - targets) ** 2
+        weighted_loss = (squared_error * weights).mean()
+        return weighted_loss
 # Main training pipeline
-def train_model(xdata, ydata, train_idxs, val_idxs, epochs=100, batch_size=32, learning_rate=0.001, 
+
+# Usage:
+def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001, 
                 val_split=0.2, patience=15):
     """
     Complete training pipeline
@@ -177,9 +203,9 @@ def train_model(xdata, ydata, train_idxs, val_idxs, epochs=100, batch_size=32, l
     # Train/validation split
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
-    # train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    train_dataset = Subset(dataset, train_idxs)
-    val_dataset = Subset(dataset, val_idxs)
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # train_dataset = Subset(dataset, train_idxs)
+    # val_dataset = Subset(dataset, val_idxs)
     
     # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -194,6 +220,8 @@ def train_model(xdata, ydata, train_idxs, val_idxs, epochs=100, batch_size=32, l
     
     # Loss and optimizer
     criterion = nn.MSELoss()
+    # criterion = MagnitudeFocusedLoss(base_weight=1.0, magnitude_penalty=10.0, threshold=0.1)
+    # criterion = WeightedMSELoss(zero_weight=1.0, nonzero_weight=5.0, threshold=0.1)
     # criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
