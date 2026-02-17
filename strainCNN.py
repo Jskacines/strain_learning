@@ -8,26 +8,40 @@ import matplotlib.pyplot as plt
 
 # Custom Dataset
 class StrainForceDataset(Dataset):
-    """Dataset for strain signal to force prediction"""
-    def __init__(self, xdata, ydata, scaler_x=None, scaler_y=None):
+    """Dataset for strain signal + scalar feature to force prediction"""
+    def __init__(self, xdata_strain, xdata_scalar, ydata, scaler_strain=None, 
+                 scaler_scalar=None, scaler_y=None):
         """
         Args:
-            xdata: (N, L) array of strain measurements
+            xdata_strain: (N, L) array of strain measurements
+            xdata_scalar: (N,) or (N, F) array of scalar features
             ydata: (N, C) array of force values at different contacts
-            scaler_x: Optional pre-fitted scaler for X
+            scaler_strain: Optional pre-fitted scaler for strain
+            scaler_scalar: Optional pre-fitted scaler for scalar
             scaler_y: Optional pre-fitted scaler for Y
         """
-        self.xdata = xdata
+        self.xdata_strain = xdata_strain
+        # Ensure scalar is 2D
+        self.xdata_scalar = xdata_scalar.reshape(-1, 1) if xdata_scalar.ndim == 1 else xdata_scalar
         self.ydata = ydata
         
-        # Normalize data
-        if scaler_x is None:
-            self.scaler_x = StandardScaler()
-            self.xdata_norm = self.scaler_x.fit_transform(xdata)
+        # Normalize strain data
+        if scaler_strain is None:
+            self.scaler_strain = StandardScaler()
+            self.xdata_strain_norm = self.scaler_strain.fit_transform(xdata_strain)
         else:
-            self.scaler_x = scaler_x
-            self.xdata_norm = self.scaler_x.transform(xdata)
+            self.scaler_strain = scaler_strain
+            self.xdata_strain_norm = self.scaler_strain.transform(xdata_strain)
+        
+        # Normalize scalar data
+        if scaler_scalar is None:
+            self.scaler_scalar = StandardScaler()
+            self.xdata_scalar_norm = self.scaler_scalar.fit_transform(self.xdata_scalar)
+        else:
+            self.scaler_scalar = scaler_scalar
+            self.xdata_scalar_norm = self.scaler_scalar.transform(self.xdata_scalar)
             
+        # Normalize y data
         if scaler_y is None:
             self.scaler_y = StandardScaler()
             self.ydata_norm = self.scaler_y.fit_transform(ydata)
@@ -36,23 +50,25 @@ class StrainForceDataset(Dataset):
             self.ydata_norm = self.scaler_y.transform(ydata)
     
     def __len__(self):
-        return len(self.xdata)
+        return len(self.xdata_strain)
     
     def __getitem__(self, idx):
         # Add channel dimension for 1D Conv: (L,) -> (1, L)
-        x = torch.FloatTensor(self.xdata_norm[idx]).unsqueeze(0)
+        x_strain = torch.FloatTensor(self.xdata_strain_norm[idx]).unsqueeze(0)
+        x_scalar = torch.FloatTensor(self.xdata_scalar_norm[idx])
         y = torch.FloatTensor(self.ydata_norm[idx])
-        return x, y
+        return x_strain, x_scalar, y
 
 
 # CNN Model
 class StrainForceCNN(nn.Module):
-    """1D CNN for strain signal to force prediction"""
-    def __init__(self, input_length, num_outputs, dropout_rate=0.6):
+    """1D CNN with FiLM for strain signal + scalar feature to force prediction"""
+    def __init__(self, input_length, num_outputs, num_scalar_features=1, dropout_rate=0.6):
         """
         Args:
             input_length: Length of input strain signal
-            num_outputs: Number of output force values (contacts)
+            num_outputs: Number of output force values
+            num_scalar_features: Number of scalar features (e.g., 1)
             dropout_rate: Dropout probability for regularization
         """
         super(StrainForceCNN, self).__init__()
@@ -63,7 +79,7 @@ class StrainForceCNN(nn.Module):
             nn.BatchNorm1d(16),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2)
         )
         
         self.conv_block2 = nn.Sequential(
@@ -71,7 +87,7 @@ class StrainForceCNN(nn.Module):
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.2),
+            nn.Dropout(0.2)
         )
         
         self.conv_block3 = nn.Sequential(
@@ -79,7 +95,14 @@ class StrainForceCNN(nn.Module):
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.2),        
+            nn.Dropout(0.2)
+        )
+        
+        # FiLM layers: scalar features → modulation parameters (gamma, beta)
+        self.film_layer = nn.Sequential(
+            nn.Linear(num_scalar_features, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64 * 2)  # 64 channels * 2 (gamma and beta)
         )
         
         # Calculate flattened size after convolutions
@@ -104,12 +127,31 @@ class StrainForceCNN(nn.Module):
         x = self.conv_block3(x)
         return x.numel()
     
-    def forward(self, x):
-        x = self.conv_block1(x)
+    def forward(self, x_strain, x_scalar):
+        """
+        Args:
+            x_strain: (batch, 1, length) - strain signal
+            x_scalar: (batch, num_scalar_features) - scalar features
+        """
+        # Process strain through conv layers
+        x = self.conv_block1(x_strain)
         x = self.conv_block2(x)
-        x = self.conv_block3(x)
-        x = x.view(x.size(0), -1)  # Flatten
+        x = self.conv_block3(x)  # (batch, 64, spatial_dim)
+        
+        # Generate modulation parameters from scalar features
+        film_params = self.film_layer(x_scalar)  # (batch, 128)
+        gamma, beta = torch.chunk(film_params, 2, dim=1)  # Each (batch, 64)
+        
+        # Apply FiLM modulation: x = gamma * x + beta
+        # Reshape to broadcast across spatial dimension
+        gamma = gamma.unsqueeze(2)  # (batch, 64, 1)
+        beta = beta.unsqueeze(2)    # (batch, 64, 1)
+        x = gamma * x + beta
+        
+        # Flatten and process through FC layers
+        x = x.view(x.size(0), -1)
         x = self.fc_layers(x)
+        
         return x
 
 # Training function
@@ -118,13 +160,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     
-    for batch_x, batch_y in dataloader:
-        batch_x = batch_x.to(device)
+    for batch_strain, batch_scalar, batch_y in dataloader:  # Now unpacking 3 items
+        batch_strain = batch_strain.to(device)
+        batch_scalar = batch_scalar.to(device)
         batch_y = batch_y.to(device)
         
         # Forward pass
         optimizer.zero_grad()
-        outputs = model(batch_x)
+        outputs = model(batch_strain, batch_scalar)  # Pass both inputs
         loss = criterion(outputs, batch_y)
         
         # Backward pass
@@ -143,11 +186,12 @@ def validate(model, dataloader, criterion, device):
     total_loss = 0
     
     with torch.no_grad():
-        for batch_x, batch_y in dataloader:
-            batch_x = batch_x.to(device)
+        for batch_strain, batch_scalar, batch_y in dataloader:  # Unpack 3 items
+            batch_strain = batch_strain.to(device)
+            batch_scalar = batch_scalar.to(device)
             batch_y = batch_y.to(device)
             
-            outputs = model(batch_x)
+            outputs = model(batch_strain, batch_scalar)  # Pass both inputs
             loss = criterion(outputs, batch_y)
             total_loss += loss.item()
     
@@ -178,14 +222,17 @@ class WeightedMSELoss(nn.Module):
 # Main training pipeline
 
 # Usage:
-def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001, 
-                val_split=0.2, patience=15):
+def train_model(xdata_strain, xdata_scalar, ydata, epochs=100, 
+                batch_size=32, learning_rate=0.001, val_split=0.2, patience=15):
     """
     Complete training pipeline
     
     Args:
-        xdata: (N, L) strain data
+        xdata_strain: (N, L) strain data
+        xdata_scalar: (N,) or (N, F) scalar feature data
         ydata: (N, C) force data
+        train_idxs: Training indices
+        val_idxs: Validation indices
         epochs: Number of training epochs
         batch_size: Batch size for training
         learning_rate: Learning rate
@@ -197,8 +244,20 @@ def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001,
         history: Training history
         dataset: Dataset with fitted scalers
     """
-    # Create dataset
-    dataset = StrainForceDataset(xdata, ydata)
+    # FIT SCALERS ONLY ON TRAINING DATA
+    scaler_strain = StandardScaler()
+    scaler_scalar = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    scaler_strain.fit(xdata_strain)
+    # Reshape scalar for StandardScaler if 1D
+    xdata_scalar_2d = xdata_scalar.reshape(-1, 1) if xdata_scalar.ndim == 1 else xdata_scalar
+    scaler_scalar.fit(xdata_scalar_2d)
+    scaler_y.fit(ydata)
+    
+    # Create dataset with pre-fitted scalers
+    dataset = StrainForceDataset(xdata_strain, xdata_scalar, ydata, 
+                                  scaler_strain, scaler_scalar, scaler_y)
     
     # Train/validation split
     val_size = int(len(dataset) * val_split)
@@ -213,16 +272,14 @@ def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001,
     
     # Initialize model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    input_length = xdata.shape[1]
+    input_length = xdata_strain.shape[1]
     num_outputs = ydata.shape[1]
+    num_scalar_features = xdata_scalar_2d.shape[1]
     
-    model = StrainForceCNN(input_length, num_outputs).to(device)
+    model = StrainForceCNN(input_length, num_outputs, num_scalar_features).to(device)
     
     # Loss and optimizer
     criterion = nn.MSELoss()
-    # criterion = MagnitudeFocusedLoss(base_weight=1.0, magnitude_penalty=10.0, threshold=0.1)
-    # criterion = WeightedMSELoss(zero_weight=1.0, nonzero_weight=5.0, threshold=0.1)
-    # criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', 
                                                        factor=0.5, patience=5)
@@ -239,8 +296,8 @@ def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001,
     best_model_state = None
     
     print(f"Training on {device}")
-    print(f"Training samples: {train_size}, Validation samples: {val_size}")
-    print(f"Input length: {input_length}, Output size: {num_outputs}\n")
+    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    print(f"Input length: {input_length}, Scalar features: {num_scalar_features}, Output size: {num_outputs}\n")
     
     # Training loop
     for epoch in range(epochs):
@@ -278,14 +335,15 @@ def train_model(xdata, ydata, epochs=100, batch_size=32, learning_rate=0.001,
 
 
 # Prediction function
-def predict(model, dataset, new_xdata, device='cpu'):
+def predict(model, dataset, new_xdata_strain, new_xdata_scalar, device='cpu'):
     """
     Make predictions on new data
     
     Args:
         model: Trained model
         dataset: Dataset with fitted scalers
-        new_xdata: New strain data (N, L)
+        new_xdata_strain: New strain data (N, L)
+        new_xdata_scalar: New scalar data (N,) or (N, F)
         device: Device to use
     
     Returns:
@@ -294,12 +352,17 @@ def predict(model, dataset, new_xdata, device='cpu'):
     model.eval()
     model.to(device)
     
-    # Normalize input
-    xdata_norm = dataset.scaler_x.transform(new_xdata)
-    x_tensor = torch.FloatTensor(xdata_norm).unsqueeze(1).to(device)
+    # Normalize inputs
+    xdata_strain_norm = dataset.scaler_strain.transform(new_xdata_strain)
+    xdata_scalar_2d = new_xdata_scalar.reshape(-1, 1) if new_xdata_scalar.ndim == 1 else new_xdata_scalar
+    xdata_scalar_norm = dataset.scaler_scalar.transform(xdata_scalar_2d)
+    
+    # Create tensors
+    x_strain_tensor = torch.FloatTensor(xdata_strain_norm).unsqueeze(1).to(device)
+    x_scalar_tensor = torch.FloatTensor(xdata_scalar_norm).to(device)
     
     with torch.no_grad():
-        predictions_norm = model(x_tensor).cpu().numpy()
+        predictions_norm = model(x_strain_tensor, x_scalar_tensor).cpu().numpy()
     
     # Inverse transform to original scale
     predictions = dataset.scaler_y.inverse_transform(predictions_norm)
